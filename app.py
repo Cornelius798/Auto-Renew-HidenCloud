@@ -46,7 +46,6 @@ def send_telegram_notification(status, old_due, new_due):
         log("⚠️ Telegram 未配置，跳过通知")
         return False
     
-    # 获取运行时间
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     if '@' in EMAIL:
@@ -173,14 +172,12 @@ def get_server_id(page):
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
 
-        # 方案1: 从 href 链接中提取 /service/数字/manage
         matches = re.findall(r'/service/(\d+)/manage', html)
         if matches:
             server_id = matches[0]
             log(f"✅ 从链接中获取到 Server ID: {server_id}")
             return server_id
 
-        # 方案2: 从 span 标签中提取 #数字 (如 "Free Server #218079")
         matches = re.findall(r'#(\d{4,})', html)
         if matches:
             server_id = matches[0]
@@ -222,25 +219,72 @@ def renew_service(page):
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        page.wait_for_timeout(3000)
         page.screenshot(path="service_page.png")
 
-        log("🖱️ 准备定位 'Renew' 按钮...")
-        # 匹配按钮或链接形式的 Renew 元素
-        renew_btn = page.locator('button:has-text("Renew"), a:has-text("Renew")').first
-        create_btn = page.locator('button:has-text("Create Invoice"), input[value*="Create Invoice"]').first
+        log("🖱️ 准备定位绿色 'Renew' 按钮...")
+
+        # 候选选择器列表
+        renew_candidates = [
+            'button:has-text("Renew"):visible',
+            'a:has-text("Renew"):visible',
+            'div:has-text("Renew") button:visible',
+            '//button[contains(normalize-space(.), "Renew")]',
+            '//a[contains(normalize-space(.), "Renew")]'
+        ]
+
+        target_btn = None
+        for sel in renew_candidates:
+            loc = page.locator(sel)
+            count = loc.count()
+            if count > 0:
+                for idx in range(count):
+                    item = loc.nth(idx)
+                    try:
+                        box = item.bounding_box()
+                        # 过滤掉不在可视工作区或尺寸异常的伪元素 (y > 100, 宽/高 > 20)
+                        if box and box['width'] > 20 and box['height'] > 20 and box['y'] > 100:
+                            target_btn = item
+                            log(f"🎯 成功锁定目标 Renew 按钮: 选择器 [{sel}] #序号 {idx}, 坐标: x={box['x']}, y={box['y']}, w={box['width']}, h={box['height']}")
+                            break
+                    except Exception:
+                        pass
+            if target_btn:
+                break
+
+        if not target_btn:
+            log("⚠️ 坐标筛选未命中，降级回退到原生角色查找")
+            target_btn = page.get_by_role("button", name=re.compile("Renew", re.I)).first
+
+        # 在真实网页上将按钮边框涂红，并在外圈加上红晕，方便截图直观核验点击位置
+        try:
+            page.evaluate("""(el) => {
+                el.style.border = '4px solid red';
+                el.style.boxShadow = '0 0 15px red';
+            }""", target_btn.element_handle())
+        except Exception as e:
+            log(f"⚠️ 注入红框高亮失败: {e}")
 
         modal_opened = False
+        create_btn = page.locator('button:has-text("Create Invoice"), input[value*="Create Invoice"]').first
+
         for i in range(3):
             try:
-                renew_btn.wait_for(state="visible", timeout=10000)
-                renew_btn.scroll_into_view_if_needed()
-                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click(force=True)
+                log(f"🖱️ 第 {i+1} 次尝试触发 'Renew'...")
+                target_btn.scroll_into_view_if_needed()
+                page.wait_for_timeout(500)
 
-                time.sleep(2)
+                # 先尝试物理点击，若失败或受阻则立即通过 JS 直接派发点击
+                try:
+                    target_btn.click(timeout=5000)
+                except Exception:
+                    log("⚠️ 物理点击受阻，触发 JavaScript 原生 click()...")
+                    page.evaluate("(el) => el.click()", target_btn.element_handle())
+
+                page.wait_for_timeout(2000)
                 page.screenshot(path=f"after_renew_click_{i+1}.png")
 
-                # 检测是否出现“未到续期时间”弹窗/文本
+                # 检测是否由于未到时间被弹窗或提示拦截
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
@@ -249,16 +293,21 @@ def renew_service(page):
 
                 log("🖲️ 等待弹窗出现...")
                 try:
-                    create_btn.wait_for(state="visible", timeout=5000)
+                    create_btn.wait_for(state="visible", timeout=6000)
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
                     page.screenshot(path="modal_opened.png")
                     break
                 except Exception:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
-                    time.sleep(2)
+                    log("⚠️ 暂未检测到 Create Invoice 按钮，检测是否存在通用模态层...")
+                    if page.locator('.modal, [role="dialog"], [x-show*="modal"]').is_visible():
+                        modal_opened = True
+                        log("✅ 检测到模态对话框容器可见！")
+                        break
+                    page.wait_for_timeout(2000)
+
             except Exception as e:
-                log(f"❌ 点击尝试出错: {e}")
+                log(f"❌ 第 {i+1} 次尝试出错: {e}")
                 page.screenshot(path=f"renew_click_err_{i+1}.png")
 
         if not modal_opened:
@@ -298,7 +347,7 @@ def renew_service(page):
         pay_btn.click(force=True)
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待支付确认页面或跳转回服务页
+        # 等待完成并跳回
         time.sleep(5)
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
@@ -311,7 +360,6 @@ def renew_service(page):
         return False
 
 def main():
-    # 检查必要环境变量
     if not COOKIE_VALUE and not (EMAIL and PASSWORD):
         log("❌ 缺少登录凭证")
         sys.exit(1)
@@ -325,7 +373,6 @@ def main():
             else:
                 log("🌐 直连模式（未使用代理）")
             
-            # 获取当前出口ip
             current_ip = get_current_ip(PROXY_SERVER)
             log(f"🎯 当前出口IP: {current_ip}")
 
@@ -346,18 +393,15 @@ def main():
             if not login(page):
                 sys.exit(1)
 
-            # 登录成功后，自动获取 Server ID
             server_id = get_server_id(page)
             if not server_id:
                 log("❌ 无法获取 Server ID，退出。")
                 sys.exit(1)
             SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
 
-            # 获取旧到期时间
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
 
-            # 执行续费
             renew_result = renew_service(page)
 
             new_due = old_due
@@ -367,12 +411,11 @@ def main():
             elif renew_result is False:
                 log("❌ 续费失败，脚本退出。")
                 status = "❌ 续期失败"
-            else:  # renew_result is True
+            else:
                 new_due = get_due_date(page)
                 log(f"📆 续费后到期时间：{new_due}")
                 status = "✅ 续期成功"
 
-            # 发送 Telegram 通知
             send_telegram_notification(status, old_due, new_due)
 
             if renew_result == "NOT_TIME":
