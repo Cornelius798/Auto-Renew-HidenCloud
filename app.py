@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests
+import os, re, sys, time, random, requests
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
-COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
-EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用,TG通知需要填写
-PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用
-TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
-TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选
+COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""     # remember_web cookie 值，必填
+EMAIL        = os.environ.get('EMAIL') or ""            # 登录邮箱,可选，作为备用,TG通知需要填写
+PASSWORD     = os.environ.get('PASSWORD') or ""         # 登录密码,可选，作为备用
+TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""     # Telegram Bot Token,可选
+TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""       # Telegram Chat ID,可选
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -33,7 +33,6 @@ def get_current_ip(proxy_server=None):
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
         resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        # log(f"请求出口IP完成, status={resp.status_code}")
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -57,7 +56,7 @@ def send_telegram_notification(status, old_due, new_due):
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****' 
+        masked_email = (EMAIL[:2] + '****') if EMAIL else "未知账号"
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
@@ -131,10 +130,10 @@ def login(page):
             page_title = page.title()
             log(f"📝 当前Title: {page_title}")
             if "auth/login" not in page.url:
-                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
+                log("✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
             log("❌ Cookie 失效，请更换")
-        except:
+        except Exception:
             pass
 
     # 2. 账号密码登录
@@ -158,8 +157,9 @@ def login(page):
         log(f"📝 当前Title: {page_title}")
         if "auth/login" in page.url:
             log("❌ 登录失败。")
+            page.screenshot(path="login_fail.png")
             return False
-        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
+        log("✅ 账号密码登录成功！当前已到达dashboard页面")
         return True
     except Exception as e:
         log(f"❌ 登录异常: {e}")
@@ -188,6 +188,7 @@ def get_server_id(page):
             return server_id
 
         log("❌ 所有 URL 均未找到 Server ID")
+        page.screenshot(path="server_id_error.png")
         return None
     except Exception as e:
         log(f"❌ 获取 Server ID 失败: {e}")
@@ -216,16 +217,17 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
-
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        page.screenshot(path="service_page.png")
 
-        log("🖱️ 准备点击 'Renew' 按钮...")
-        renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
+        log("🖱️ 准备定位 'Renew' 按钮...")
+        # 匹配按钮或链接形式的 Renew 元素
+        renew_btn = page.locator('button:has-text("Renew"), a:has-text("Renew")').first
+        create_btn = page.locator('button:has-text("Create Invoice"), input[value*="Create Invoice"]').first
 
         modal_opened = False
         for i in range(3):
@@ -233,27 +235,31 @@ def renew_service(page):
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
+                renew_btn.click(force=True)
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 time.sleep(2)
+                page.screenshot(path=f"after_renew_click_{i+1}.png")
+
+                # 检测是否出现“未到续期时间”弹窗/文本
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
+                    return "NOT_TIME"
 
                 log("🖲️ 等待弹窗出现...")
                 try:
                     create_btn.wait_for(state="visible", timeout=5000)
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
+                    page.screenshot(path="modal_opened.png")
                     break
-                except:
+                except Exception:
                     log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
                     time.sleep(2)
             except Exception as e:
                 log(f"❌ 点击尝试出错: {e}")
+                page.screenshot(path=f"renew_click_err_{i+1}.png")
 
         if not modal_opened:
             log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
@@ -262,7 +268,7 @@ def renew_service(page):
 
         handle_cloudflare(page)
         log("🖱️ 点击 'Create Invoice'...")
-        create_btn.click()
+        create_btn.click(force=True)
 
         new_invoice_url = None
         start_wait = time.time()
@@ -284,18 +290,19 @@ def renew_service(page):
         if page.url != new_invoice_url:
             page.goto(new_invoice_url)
         handle_cloudflare(page)
+        page.screenshot(path="invoice_page.png")
 
         log("🔎 查找 'Pay' 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
+        pay_btn.click(force=True)
         log("✅ 'Pay' 按钮已点击。")
 
         # 等待支付确认页面或跳转回服务页
         time.sleep(5)
-        # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        page.screenshot(path="renew_finished.png")
         return True
 
     except Exception as e:
@@ -380,6 +387,6 @@ def main():
         finally:
             if 'browser' in locals() and browser:
                 browser.close()
-                
+
 if __name__ == "__main__":
     main()
