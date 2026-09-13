@@ -47,10 +47,7 @@ def send_telegram_notification(status, old_due, new_due):
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
+        masked_email = f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
     else:
         masked_email = (EMAIL[:2] + '****') if EMAIL else "未知账号"
 
@@ -70,12 +67,7 @@ def send_telegram_notification(status, old_due, new_due):
     }
     try:
         resp = requests.post(url, json=payload, timeout=10, proxies=REQUESTS_PROXIES)
-        if resp.status_code == 200:
-            log("✅ Telegram 通知发送成功")
-            return True
-        else:
-            log(f"❌ Telegram 通知失败: {resp.text}")
-            return False
+        return resp.status_code == 200
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
@@ -94,7 +86,6 @@ def handle_cloudflare(page):
             frame = page.frame_locator(iframe_selector)
             checkbox = frame.locator('input[type="checkbox"]')
             if checkbox.is_visible():
-                log("🖱️ 点击验证复选框...")
                 time.sleep(random.uniform(0.5, 1.5))
                 checkbox.click()
                 time.sleep(5)
@@ -123,7 +114,6 @@ def login(page):
             if "auth/login" not in page.url:
                 log("✅ Cookie 登录成功！")
                 return True
-            log("❌ Cookie 失效")
         except Exception:
             pass
 
@@ -144,11 +134,13 @@ def login(page):
         handle_cloudflare(page)
         if "auth/login" in page.url:
             log("❌ 登录失败。")
+            page.screenshot(path="login_failed.png")
             return False
         log("✅ 账号密码登录成功！")
         return True
     except Exception as e:
         log(f"❌ 登录异常: {e}")
+        page.screenshot(path="login_failed.png")
         return False
 
 def get_server_id(page):
@@ -156,15 +148,14 @@ def get_server_id(page):
         handle_cloudflare(page)
         time.sleep(2)
         html = page.content()
-        matches = re.findall(r'/service/(\d+)/manage', html)
+        matches = re.findall(r'/service/(\d+)/manage', html) or re.findall(r'#(\d{4,})', html)
         if matches:
             return matches[0]
-        matches = re.findall(r'#(\d{4,})', html)
-        if matches:
-            return matches[0]
+        page.screenshot(path="server_id_failed.png")
         return None
     except Exception as e:
         log(f"❌ 获取 Server ID 失败: {e}")
+        page.screenshot(path="server_id_failed.png")
         return None
 
 def get_due_date(page):
@@ -202,43 +193,33 @@ def renew_service(page, server_id):
             log("⚠️ 未到续期时间，无法续期。")
             return "NOT_TIME"
 
-        log("🚀 绕过失灵的按钮，直接提交后台的续费表单...")
-        # 1. 尝试直接从页面 DOM 提交该续期 form
+        log("🚀 提交后台续费表单...")
         form_selector = f'form[action*="/service/{server_id}/renew"]'
         
-        submitted = False
-        try:
-            # 确保 select 的 days 参数为 7
-            page.evaluate(f"""() => {{
-                const form = document.querySelector('{form_selector}');
-                if (form) {{
-                    const daysInput = form.querySelector('select[name="days"], input[name="days"]');
-                    if (daysInput) daysInput.value = '7';
-                    form.submit();
-                    return true;
-                }}
-                return false;
-            }}""")
-            submitted = True
-            log("✅ 已成功调用表单 form.submit()！等待发票生成...")
-        except Exception as e:
-            log(f"⚠️ form.submit() 调用失败: {e}")
+        # 直接调用 form.submit()
+        page.evaluate(f"""() => {{
+            const form = document.querySelector('{form_selector}');
+            if (form) {{
+                const daysInput = form.querySelector('select[name="days"], input[name="days"]');
+                if (daysInput) daysInput.value = '7';
+                form.submit();
+            }}
+        }}""")
 
-        # 等待页面跳转到发票页
+        # 等待跳转到发票页面
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 60:
             if "/payment/invoice/" in page.url:
                 new_invoice_url = page.url
-                log(f"🎉 页面成功跳转至发票页: {new_invoice_url}")
+                log(f"🎉 页面已跳转至发票页: {new_invoice_url}")
                 break
             if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
                 handle_cloudflare(page)
             time.sleep(1)
 
-        # 如果直接 submit 未引起页面跳转，尝试让 modal 显示并点击其内部的真实按钮
+        # 备选：如果直接 submit 未跳转，强制展示 modal 并点击
         if not new_invoice_url:
-            log("⚠️ 表单直接提交未跳转，尝试强制显示 Flowbite Modal 并点击 Create Invoice...")
             page.evaluate(f"""() => {{
                 const modal = document.getElementById('renewService-{server_id}');
                 if (modal) {{
@@ -250,37 +231,29 @@ def renew_service(page, server_id):
             create_btn = page.locator(f'#renewService-{server_id} button[type="submit"]')
             if create_btn.count() > 0:
                 create_btn.first.click(force=True)
-                log("🖱️ 已点击模态框内的 'Create Invoice' 提交按钮")
-                
-                # 再次等待跳转
                 start_wait = time.time()
                 while time.time() - start_wait < 60:
                     if "/payment/invoice/" in page.url:
                         new_invoice_url = page.url
-                        log(f"🎉 页面已跳转: {new_invoice_url}")
+                        log(f"🎉 页面已跳转至发票页: {new_invoice_url}")
                         break
                     time.sleep(1)
 
         if not new_invoice_url:
-            log("❌ 未能成功生成并进入发票页面。")
+            log("❌ 未能成功进入发票页面。")
             page.screenshot(path="renew_submit_failed.png")
             return False
 
-        # 处理发票支付
+        # 支付账单
         handle_cloudflare(page)
-        page.wait_for_timeout(2000)
-        page.screenshot(path="invoice_page.png")
-
-        log("🔎 查找 'Pay' 按钮...")
         pay_btn = page.locator('button:has-text("Pay"), a:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
         pay_btn.click(force=True)
-        log("✅ 'Pay' 按钮已成功点击！")
+        log("✅ 'Pay' 按钮已点击！")
 
         time.sleep(6)
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        page.screenshot(path="renew_finished.png")
         return True
 
     except Exception as e:
@@ -297,11 +270,6 @@ def main():
 
     with sync_playwright() as p:
         try:
-            if IS_PROXY:
-                log(f"⚙️ 代理已启用: {PROXY_SERVER}")
-            else:
-                log("🌐 直连模式（未使用代理）")
-            
             current_ip = get_current_ip(PROXY_SERVER)
             log(f"🎯 出口IP: {current_ip}")
 
@@ -327,7 +295,6 @@ def main():
                 log("❌ 无法获取 Server ID，退出。")
                 sys.exit(1)
             SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
-            log(f"🎯 目标管理地址: {SERVICE_URL}")
 
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
@@ -355,6 +322,8 @@ def main():
 
         except Exception as e:
             log(f"❌ 运行异常: {e}")
+            if 'page' in locals() and page:
+                page.screenshot(path="fatal_error.png")
             sys.exit(1)
         finally:
             if 'browser' in locals() and browser:
