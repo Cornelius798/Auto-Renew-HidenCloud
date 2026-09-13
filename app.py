@@ -19,7 +19,6 @@ IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
-# 日志
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
@@ -110,7 +109,6 @@ def handle_cloudflare(page):
     return False
 
 def login(page):
-    # 1. Cookie 登录尝试
     if COOKIE_VALUE:
         log("📇 尝试 Cookie 登录...")
         try:
@@ -135,7 +133,6 @@ def login(page):
         except Exception:
             pass
 
-    # 2. 账号密码登录
     if not EMAIL or not PASSWORD:
         return False
     log("💣 尝试账号密码登录...")
@@ -213,6 +210,43 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
+def try_pay_existing_invoices(page):
+    """当 Renew 无法弹出时，直接去左侧 Invoices 页面支付已生成的账单"""
+    log("💡 检测到可能已生成续期账单，尝试进入 Invoices 页面核销...")
+    try:
+        invoices_link = page.locator('a[href*="/invoices"], a:has-text("Invoices")').first
+        if invoices_link.is_visible():
+            invoices_link.click()
+        else:
+            page.goto(f"{BASE_URL}/invoices", wait_until="domcontentloaded", timeout=30000)
+        
+        handle_cloudflare(page)
+        page.wait_for_timeout(3000)
+        page.screenshot(path="invoices_list_page.png")
+
+        # 查找未支付账单 (Unpaid / Pending)
+        unpaid_items = page.locator('a:has-text("Unpaid"), a:has-text("Pay"), a:has-text("View"):visible')
+        count = unpaid_items.count()
+        log(f"📋 发现可能待付的链接/账单数量: {count}")
+        if count > 0:
+            target_invoice = unpaid_items.first
+            log("🖱️ 点击进入最新的账单...")
+            target_invoice.click()
+            page.wait_for_timeout(3000)
+            handle_cloudflare(page)
+            page.screenshot(path="invoice_detail_page.png")
+
+            pay_btn = page.locator('button:has-text("Pay"), a:has-text("Pay"):visible, input[value*="Pay"]').first
+            if pay_btn.is_visible():
+                log("✅ 在账单页面找到 Pay 按钮，执行支付...")
+                pay_btn.click(force=True)
+                page.wait_for_timeout(5000)
+                page.screenshot(path="invoice_paid_success.png")
+                return True
+    except Exception as e:
+        log(f"⚠️ 处理已有账单失败: {e}")
+    return False
+
 def renew_service(page):
     try:
         log("➡ 进入续期流程...")
@@ -222,9 +256,12 @@ def renew_service(page):
         page.wait_for_timeout(3000)
         page.screenshot(path="service_page.png")
 
-        log("🖱️ 准备定位绿色 'Renew' 按钮...")
+        # 保存整页 HTML 供 F12 深度调试
+        with open("page_source.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log("💾 已导出完整页面源码到 page_source.html")
 
-        # 候选选择器列表
+        log("🖱️ 定位绿色 'Renew' 按钮并提取 F12 DOM 详情...")
         renew_candidates = [
             'button:has-text("Renew"):visible',
             'a:has-text("Renew"):visible',
@@ -242,10 +279,8 @@ def renew_service(page):
                     item = loc.nth(idx)
                     try:
                         box = item.bounding_box()
-                        # 过滤掉不在可视工作区或尺寸异常的伪元素 (y > 100, 宽/高 > 20)
                         if box and box['width'] > 20 and box['height'] > 20 and box['y'] > 100:
                             target_btn = item
-                            log(f"🎯 成功锁定目标 Renew 按钮: 选择器 [{sel}] #序号 {idx}, 坐标: x={box['x']}, y={box['y']}, w={box['width']}, h={box['height']}")
                             break
                     except Exception:
                         pass
@@ -253,67 +288,70 @@ def renew_service(page):
                 break
 
         if not target_btn:
-            log("⚠️ 坐标筛选未命中，降级回退到原生角色查找")
+            log("⚠️ 坐标筛选未命中，降级为原生查找")
             target_btn = page.get_by_role("button", name=re.compile("Renew", re.I)).first
 
-        # 在真实网页上将按钮边框涂红，并在外圈加上红晕，方便截图直观核验点击位置
-        try:
-            page.evaluate("""(el) => {
-                el.style.border = '4px solid red';
-                el.style.boxShadow = '0 0 15px red';
-            }""", target_btn.element_handle())
-        except Exception as e:
-            log(f"⚠️ 注入红框高亮失败: {e}")
+        # 抓取并输出 F12 DOM 信息
+        btn_info = page.evaluate("""(el) => {
+            return {
+                tag: el.tagName,
+                outerHTML: el.outerHTML,
+                disabled: el.disabled || false,
+                onclick: el.getAttribute('onclick'),
+                x_on_click: el.getAttribute('x-on:click') || el.getAttribute('@click'),
+                wire_click: el.getAttribute('wire:click'),
+                data_modal: el.getAttribute('data-modal-target') || el.getAttribute('data-target') || el.getAttribute('data-bs-target')
+            };
+        }""", target_btn.element_handle())
+
+        with open("dom_debug.txt", "w", encoding="utf-8") as f:
+            for k, v in btn_info.items():
+                f.write(f"{k}: {v}\n")
+        log(f"🔎 [F12 诊断] 按钮信息:\n  标签: {btn_info.get('tag')}\n  HTML: {btn_info.get('outerHTML')}\n  Alpine/Wire/Modal属性: {btn_info.get('x_on_click') or btn_info.get('wire_click') or btn_info.get('data_modal')}")
 
         modal_opened = False
         create_btn = page.locator('button:has-text("Create Invoice"), input[value*="Create Invoice"]').first
 
         for i in range(3):
             try:
-                log(f"🖱️ 第 {i+1} 次尝试触发 'Renew'...")
+                log(f"🖱️ 第 {i+1} 次点击 'Renew'...")
                 target_btn.scroll_into_view_if_needed()
                 page.wait_for_timeout(500)
 
-                # 先尝试物理点击，若失败或受阻则立即通过 JS 直接派发点击
-                try:
-                    target_btn.click(timeout=5000)
-                except Exception:
-                    log("⚠️ 物理点击受阻，触发 JavaScript 原生 click()...")
-                    page.evaluate("(el) => el.click()", target_btn.element_handle())
+                # 尝试通过多种触发方式派发 click
+                page.evaluate("""(el) => {
+                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    el.click();
+                }""", target_btn.element_handle())
 
                 page.wait_for_timeout(2000)
                 page.screenshot(path=f"after_renew_click_{i+1}.png")
 
-                # 检测是否由于未到时间被弹窗或提示拦截
-                page_text = page.locator("body").inner_text()
-                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"
-
-                log("🖲️ 等待弹窗出现...")
+                # 检查弹窗
                 try:
-                    create_btn.wait_for(state="visible", timeout=6000)
+                    create_btn.wait_for(state="visible", timeout=4000)
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
                     page.screenshot(path="modal_opened.png")
                     break
                 except Exception:
-                    log("⚠️ 暂未检测到 Create Invoice 按钮，检测是否存在通用模态层...")
-                    if page.locator('.modal, [role="dialog"], [x-show*="modal"]').is_visible():
-                        modal_opened = True
-                        log("✅ 检测到模态对话框容器可见！")
-                        break
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(1000)
 
             except Exception as e:
-                log(f"❌ 第 {i+1} 次尝试出错: {e}")
-                page.screenshot(path=f"renew_click_err_{i+1}.png")
+                log(f"❌ 点击出错: {e}")
 
         if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
-            page.screenshot(path="renew_modal_failed.png")
-            return False
+            log("❌ 续费弹窗未出现，启动备选方案：检查已有 Invoices...")
+            if try_pay_existing_invoices(page):
+                log("🎉 已有账单支付完成！")
+                page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                handle_cloudflare(page)
+                return True
+            else:
+                log("❌ 弹窗未出现且未能通过 Invoices 页面支付。")
+                page.screenshot(path="renew_modal_failed.png")
+                return False
 
         handle_cloudflare(page)
         log("🖱️ 点击 'Create Invoice'...")
@@ -347,7 +385,6 @@ def renew_service(page):
         pay_btn.click(force=True)
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待完成并跳回
         time.sleep(5)
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
