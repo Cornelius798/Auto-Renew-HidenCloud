@@ -47,12 +47,15 @@ jobs:
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
 
-      - name: 📸 上传调试截图
+      - name: 📸 上传调试截图及 F12 DOM 源码
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
-          path: "*.png"
+          name: debug-artifacts
+          path: |
+            *.png
+            *.txt
+            *.html
           retention-days: 3
 
       - name: 🧽 清理进程和临时文件
